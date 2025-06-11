@@ -1,0 +1,230 @@
+import asyncio
+import websockets
+import json
+import logging
+from collections import deque, Counter
+import random
+import numpy as np
+
+# --- Configuration ---
+# It's highly recommended to load these from environment variables or a config file
+# rather than hardcoding, especially for API_TOKEN.
+# Example: API_TOKEN = os.getenv('BINARY_API_TOKEN', 'your_default_token_here')
+API_TOKEN = 'xC7PUhu639elfc9'  # Make sure this token is valid and kept secure
+APP_ID = '75980'
+WS_URL = f'wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}'
+
+# --- Trade Parameters ---
+SYMBOL = "R_100"
+CONTRACT_TYPE = "DIGITDIFF"
+DURATION = 2  # in ticks (t)
+CURRENCY = "USD"
+NUM_TRADES = 10
+START_AMOUNT = 10.0  # Use float for financial calculations
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+async def receiver(ws, queue):
+    """Continuously receives messages from the WebSocket and puts them into the queue."""
+    try:
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            await queue.put(data)
+    except websockets.exceptions.ConnectionClosedOK:
+        logger.info("WebSocket connection closed gracefully in receiver.")
+    except Exception as e:
+        logger.error(f"Error in receiver: {e}")
+
+async def place_trade(ws, amount, prediction):
+    """Places a 'DIGITDIFF' trade with the given amount and predicted barrier."""
+    request = {
+        "buy": 1,
+        "price": round(amount, 2), # Ensure price is rounded for API
+        "parameters": {
+            "amount": round(amount, 2),
+            "basis": "stake",
+            "contract_type": CONTRACT_TYPE,
+            "currency": CURRENCY,
+            "duration": DURATION,
+            "duration_unit": "t",
+            "symbol": SYMBOL,
+            "barrier": str(prediction) # Barrier is your prediction for "Differs"
+        }
+    }
+    logger.info(f"Placing trade: {request['parameters']}")
+    await ws.send(json.dumps(request))
+
+async def check_result(ws, queue, contract_id):
+    """
+    Checks the result of an open contract.
+    Correctly extracts the exit_tick_value for DIGITDIFF contracts.
+    """
+    while True:
+        await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": contract_id}))
+        try:
+            # Add a timeout to prevent indefinite blocking
+            data = await asyncio.wait_for(queue.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for contract result {contract_id}. Retrying...")
+            continue
+        except Exception as e:
+            logger.error(f"Error getting from queue in check_result: {e}")
+            break # Exit loop on unrecoverable error
+
+        if "proposal_open_contract" in data:
+            contract = data["proposal_open_contract"]
+            if contract.get("is_sold"):
+                profit = contract.get("profit", 0)
+                result = "WON" if profit > 0 else "LOST" # For DIGITDIFF, profit > 0 means WON
+
+                # Crucial: Get the exit_tick_value to determine the actual last digit
+                exit_tick_value = contract.get("exit_tick_value")
+                last_digit = -1 # Default if not found
+                if exit_tick_value is not None:
+                    try:
+                        # Ensure exit_tick_value is treated as a string to get the last digit
+                        last_digit = int(str(exit_tick_value)[-1])
+                    except (ValueError, IndexError):
+                        logger.warning(f"Could not extract last digit from exit_tick_value: {exit_tick_value}")
+                else:
+                    logger.warning(f"exit_tick_value not found for contract {contract_id}")
+
+                return last_digit, result
+        await asyncio.sleep(0.3) # Avoid busy-waiting, give API time
+
+# --- Volatility Calculation (kept for potential future use) ---
+def calculate_volatility(recent_digits: deque):
+    """Returns volatility score for each digit (standard deviation of frequency)."""
+    if len(recent_digits) < 10:
+        return {d: 0 for d in range(10)}
+
+    digit_counts = Counter(recent_digits)
+    frequencies = np.array([digit_counts[d] for d in range(10)])
+
+    # A more robust volatility score might compare individual frequency to average or standard deviation
+    avg_frequency = np.mean(frequencies)
+    volatility_scores = {digit: abs(frequencies[digit] - avg_frequency) for digit in range(10)}
+    return volatility_scores
+
+# --- Updated Strategy for "Differs" ---
+def strategy_differential_prediction(recent_digits: deque):
+    """
+    Generates a prediction for 'DIGITDIFF' contracts.
+    It predicts the digit that has appeared least frequently in recent_digits,
+    as this digit is statistically most likely to 'differ'.
+    """
+    if len(recent_digits) < 20: # Increased minimum history for better statistics
+        logger.info("Not enough recent digits for a meaningful prediction. Returning random.")
+        return random.choice(range(10)) # Fallback to random if not enough data
+
+    digit_counts = Counter(recent_digits)
+    
+    min_frequency = float('inf')
+    least_frequent_digits = []
+
+    for digit in range(10):
+        count = digit_counts[digit]
+        if count < min_frequency:
+            min_frequency = count
+            least_frequent_digits = [digit]
+        elif count == min_frequency:
+            least_frequent_digits.append(digit)
+
+    # If multiple digits have the same minimum frequency, pick one randomly
+    prediction = random.choice(least_frequent_digits)
+    logger.debug(f"Recent digits: {list(recent_digits)}, Counts: {digit_counts}, Predicted NOT: {prediction}")
+    return prediction
+
+
+# --- Main Trade Loop ---
+async def trade_sequence():
+    queue = asyncio.Queue()
+    # Keep a longer history for better statistical analysis for DIGITDIFF
+    recent_digits = deque(maxlen=100)
+    trade_history = []
+    
+    current_amount = START_AMOUNT
+
+    try:
+        async with websockets.connect(WS_URL) as ws:
+            # Start the receiver task immediately
+            receiver_task = asyncio.create_task(receiver(ws, queue))
+
+            # Authorize with the API token
+            await ws.send(json.dumps({"authorize": API_TOKEN}))
+            auth_response = await asyncio.wait_for(queue.get(), timeout=10.0) # Add timeout for auth
+            if "error" in auth_response:
+                logger.error(f"Authentication failed: {auth_response['error']['message']}")
+                receiver_task.cancel()
+                return
+
+            logger.info("✅ Authenticated. Starting DIGITDIFF Trading...")
+
+            for i in range(NUM_TRADES):
+                logger.info(f"\n--- Trade {i+1}/{NUM_TRADES} ---")
+
+                # The strategy now directly returns a single best prediction for "Differs"
+                selected_prediction = strategy_differential_prediction(recent_digits)
+
+                logger.info(f"[{i+1}] Predicting that the last digit will NOT be: {selected_prediction}")
+                await place_trade(ws, current_amount, selected_prediction)
+
+                trade_response = await asyncio.wait_for(queue.get(), timeout=10.0) # Timeout for trade response
+                if "buy" not in trade_response:
+                    logger.error(f"❌ Trade placement failed: {trade_response.get('error', {}).get('message', 'Unknown error')}")
+                    # Decide on error handling: skip trade, retry, stop?
+                    continue
+
+                contract_id = trade_response["buy"]["contract_id"]
+                
+                # Check result and get the actual last digit from the exit tick value
+                last_digit_from_exit_tick, result = await check_result(ws, queue, contract_id)
+
+                # Add the actual last digit to history for future predictions
+                if last_digit_from_exit_tick != -1: # Only add if a valid digit was extracted
+                    recent_digits.append(last_digit_from_exit_tick)
+
+                trade_history.append({
+                    "trade_number": i + 1,
+                    "prediction_not": selected_prediction, # Clarify this is the "not" prediction
+                    "result": result,
+                    "last_digit_actual": last_digit_from_exit_tick,
+                    "stake_amount": current_amount
+                })
+
+                logger.info(f"[{i+1}] ✅ Result: {result} | Actual last digit: {last_digit_from_exit_tick} | Predicted NOT: {selected_prediction} | Stake: ${round(current_amount,2)}")
+
+                if result == "WON":
+                    current_amount *= 1.08  # Slight profit compounding
+                    logger.info(f"💰 WON! New amount: ${round(current_amount, 2)}")
+                else:
+                    current_amount = START_AMOUNT  # Reset on loss
+                    logger.info(f"💔 LOST! Resetting amount to: ${round(current_amount, 2)}")
+
+                await asyncio.sleep(0.5) # Small delay to avoid hitting rate limits and allow server to process
+
+            logger.info("\n--- Trading Sequence Completed ---")
+            logger.info("Trade History:")
+            for trade in trade_history:
+                logger.info(f"  Trade {trade['trade_number']}: Predicted NOT {trade['prediction_not']}, Actual {trade['last_digit_actual']}, Result {trade['result']}, Stake ${round(trade['stake_amount'], 2)}")
+
+    except websockets.exceptions.ConnectionClosed:
+        logger.error("WebSocket connection closed unexpectedly.")
+    except asyncio.TimeoutError:
+        logger.error("A critical operation timed out. Exiting.")
+    except Exception as e:
+        logger.critical(f"An unhandled error occurred: {e}", exc_info=True)
+    finally:
+        # Ensure the receiver task is cancelled when the main loop exits
+        if 'receiver_task' in locals() and not receiver_task.done():
+            receiver_task.cancel()
+            try:
+                await receiver_task # Await to ensure cancellation is processed
+            except asyncio.CancelledError:
+                logger.info("Receiver task cancelled.")
+
+if __name__ == "__main__":
+    asyncio.run(trade_sequence())
