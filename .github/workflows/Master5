@@ -1,0 +1,222 @@
+import asyncio
+import websockets
+import json
+import logging
+from collections import deque, Counter
+
+# --- Configuration ---
+API_TOKEN = 'xC7PUhu639elfc9'  # Replace with a valid token
+APP_ID = '75980'
+WS_URL = f'wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}'
+
+# --- Trade Parameters ---
+SYMBOL = "R_100"
+CONTRACT_TYPE = "DIGITDIFF"
+DURATION = 2  # in ticks
+CURRENCY = "USD"
+NUM_TRADES = 10
+START_AMOUNT = 3.13
+
+# --- Risk Management ---
+MAX_LOSS_PER_TRADE_PERCENT = 0.90
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+async def receiver(ws, queue):
+    """Listens for messages from the WebSocket and puts them in a queue."""
+    try:
+        while True:
+            message = await ws.recv()
+            data = json.loads(message)
+            await queue.put(data)
+    except websockets.exceptions.ConnectionClosedOK:
+        logger.info("WebSocket connection closed gracefully in receiver.")
+    except Exception as e:
+        logger.error(f"Error in receiver: {e}")
+
+async def place_trade(ws, amount, prediction):
+    """Sends a request to buy a contract."""
+    request = {
+        "buy": 1,
+        "price": round(amount, 2),
+        "parameters": {
+            "amount": round(amount, 2),
+            "basis": "stake",
+            "contract_type": CONTRACT_TYPE,
+            "currency": CURRENCY,
+            "duration": DURATION,
+            "duration_unit": "t",
+            "symbol": SYMBOL,
+            "barrier": str(prediction)
+        }
+    }
+    logger.info(f"Placing trade: {request['parameters']}")
+    await ws.send(json.dumps(request))
+
+async def check_result(ws, queue, contract_id):
+    """Checks the result of an open contract."""
+    while True:
+        await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": contract_id}))
+        try:
+            data = await asyncio.wait_for(queue.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for contract result {contract_id}. Retrying...")
+            continue
+        except Exception as e:
+            logger.error(f"Error getting from queue in check_result: {e}")
+            break
+
+        if "proposal_open_contract" in data and data["proposal_open_contract"]:
+            contract = data["proposal_open_contract"]
+            if contract.get("is_sold"):
+                profit = contract.get("profit", 0)
+                result = "WON" if profit > 0 else "LOST"
+                exit_tick_value = contract.get("exit_tick")
+                last_digit = -1
+                if exit_tick_value is not None:
+                    try:
+                        # The last digit is the final character of the exit tick string
+                        last_digit = int(str(exit_tick_value)[-1])
+                    except (ValueError, IndexError):
+                        logger.warning(f"Could not extract last digit from: {exit_tick_value}")
+                else:
+                    logger.warning(f"exit_tick not found for contract {contract_id}")
+                return last_digit, result
+        await asyncio.sleep(0.3)
+
+def strategy_differential_prediction(recent_digits: deque, last_losing_prediction: int = None):
+    """
+    Predicts which digit will NOT be the last digit using a deterministic method.
+    UPDATED: This function is now fully deterministic and does not use random.
+    """
+    # Create a list of all possible digits (0-9)
+    possible_predictions = list(range(10))
+
+    # If there was a losing prediction on the last trade, remove it from the list of possibilities.
+    if last_losing_prediction is not None and last_losing_prediction in possible_predictions:
+        possible_predictions.remove(last_losing_prediction)
+        logger.info(f"Avoiding last losing prediction: {last_losing_prediction}")
+
+    # Fallback in case the list becomes empty (should not happen with this logic).
+    # Returns 0 instead of a random number.
+    if not possible_predictions:
+        return 0
+
+    if len(recent_digits) < 20:
+        logger.info("Not enough recent digits. Picking first available deterministic digit.")
+        # --- NO LONGER RANDOM ---
+        # Picks the first, and therefore smallest, digit from the list of possibilities.
+        return possible_predictions[0]
+
+    digit_counts = Counter(recent_digits)
+    
+    min_frequency = float('inf')
+    least_frequent_digits = []
+
+    for digit in possible_predictions: # Only check amongst the digits we are allowed to choose
+        count = digit_counts[digit]
+        if count < min_frequency:
+            min_frequency = count
+            least_frequent_digits = [digit]
+        elif count == min_frequency:
+            least_frequent_digits.append(digit)
+    
+    # If for some reason our list of least frequent digits is empty,
+    # pick the first available digit as a fallback.
+    if not least_frequent_digits:
+        return possible_predictions[0]
+
+    # --- NO LONGER RANDOM ---
+    # Sort the list of least frequent digits and pick the smallest one.
+    # This makes the choice deterministic.
+    least_frequent_digits.sort()
+    prediction = least_frequent_digits[0]
+
+    logger.debug(f"Prediction (NOT): {prediction}")
+    return prediction
+
+async def trade_sequence():
+    """Main function to run the trading sequence."""
+    queue = asyncio.Queue()
+    recent_digits = deque(maxlen=100)
+    trade_history = []
+    current_amount = START_AMOUNT
+    last_losing_prediction = None
+
+    try:
+        async with websockets.connect(WS_URL) as ws:
+            receiver_task = asyncio.create_task(receiver(ws, queue))
+
+            await ws.send(json.dumps({"authorize": API_TOKEN}))
+            auth_response = await asyncio.wait_for(queue.get(), timeout=10.0)
+            if "error" in auth_response:
+                logger.error(f"Authentication failed: {auth_response['error']['message']}")
+                receiver_task.cancel()
+                return
+
+            logger.info("✅ Authenticated. Starting DIGITDIFF Trading...")
+
+            for i in range(NUM_TRADES):
+                logger.info(f"\n--- Trade {i+1}/{NUM_TRADES} ---")
+
+                if current_amount < START_AMOUNT * (1 - MAX_LOSS_PER_TRADE_PERCENT):
+                    logger.warning("❌ Loss threshold hit. Resetting amount.")
+                    current_amount = START_AMOUNT
+                
+                selected_prediction = strategy_differential_prediction(recent_digits, last_losing_prediction)
+                logger.info(f"[{i+1}] Predicting NOT: {selected_prediction}")
+                await place_trade(ws, current_amount, selected_prediction)
+
+                trade_response = await asyncio.wait_for(queue.get(), timeout=10.0)
+                if "buy" not in trade_response or not trade_response["buy"]:
+                    logger.error(f"❌ Trade failed: {trade_response.get('error', {}).get('message', 'Unknown error')}")
+                    continue
+
+                contract_id = trade_response["buy"]["contract_id"]
+                last_digit_from_exit_tick, result = await check_result(ws, queue, contract_id)
+
+                if last_digit_from_exit_tick != -1:
+                    recent_digits.append(last_digit_from_exit_tick)
+
+                trade_history.append({
+                    "trade_number": i + 1,
+                    "prediction_not": selected_prediction,
+                    "result": result,
+                    "last_digit_actual": last_digit_from_exit_tick,
+                    "stake_amount": current_amount
+                })
+
+                logger.info(f"[{i+1}] ✅ Result: {result} | Actual: {last_digit_from_exit_tick} | Predicted NOT: {selected_prediction} | Stake: ${round(current_amount, 2)}")
+
+                if result == "WON":
+                    current_amount *= 1.08
+                    logger.info(f"💰 WON! New stake: ${round(current_amount, 2)}")
+                    last_losing_prediction = None
+                else:
+                    current_amount = START_AMOUNT
+                    logger.info(f"💔 LOST! Resetting stake to: ${round(current_amount, 2)}")
+                    last_losing_prediction = selected_prediction
+
+                await asyncio.sleep(2.5)  # Delay between trades
+
+    except asyncio.TimeoutError:
+        logger.error("A WebSocket operation timed out. Please check your connection.")
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.error(f"WebSocket connection closed unexpectedly: {e}")
+    except Exception as e:
+        logger.error(f"Fatal error in trade_sequence: {e}", exc_info=True)
+    finally:
+        logger.info("Trade sequence finished.")
+        if 'receiver_task' in locals() and not receiver_task.done():
+            receiver_task.cancel()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(trade_sequence())
+    except KeyboardInterrupt:
+        logger.info("Program interrupted by user. Exiting.")
+
+
